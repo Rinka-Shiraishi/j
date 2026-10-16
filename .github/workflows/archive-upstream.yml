@@ -61,3 +61,37 @@ jobs:
             --notes "Immutable Git bundle snapshot of https://github.com/${SOURCE_REPO}; captured ref fingerprint ${fingerprint}. Download upstream.bundle to restore original branches and history."
 
           echo "Saved new independent restore point: ${snapshot}"
+      - name: Keep only the two newest valid archive snapshots
+        if: success()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Delete only our own historical snapshot Releases, never other releases.
+          # Retention is skipped if cloning or publishing the new archive failed.
+          gh release list --repo "${DEST_REPO}" --limit 1000 \
+            --json tagName,publishedAt,isDraft > releases.json
+          jq -r '[.[] | select((.isDraft | not) and (.tagName | test("^snapshot-[0-9a-f]{20}$")))] | sort_by(.publishedAt) | reverse | .[].tagName' \
+            releases.json > snapshots.txt
+          mapfile -t snapshots < snapshots.txt
+          if (( ${#snapshots[@]} <= 2 )); then
+            echo "Keeping ${#snapshots[@]} snapshot(s); nothing to prune."
+            exit 0
+          fi
+
+          # Check BOTH survivors still have complete, nonempty restorable bundle assets.
+          # If either snapshot appears incomplete, leave every older backup untouched.
+          for tag in "${snapshots[@]:0:2}"; do
+            count="$(gh api "repos/${DEST_REPO}/releases/tags/${tag}" \
+              --jq '[.assets[] | select(.name == "upstream.bundle" and .size > 0)] | length')"
+            if [[ "${count}" != "1" ]]; then
+              echo "::error::Snapshot ${tag} has no valid Git bundle. No archives deleted."
+              exit 1
+            fi
+          done
+
+          for tag in "${snapshots[@]:2}"; do
+            echo "Pruning older verified snapshot: ${tag}"
+            gh release delete "${tag}" --repo "${DEST_REPO}" --cleanup-tag --yes
+          done
+          echo 'Archive retention complete: latest two snapshots kept.'
