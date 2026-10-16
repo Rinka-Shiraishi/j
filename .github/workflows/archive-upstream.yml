@@ -1,0 +1,57 @@
+name: Archive upstream Git history
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/archive-upstream.yml
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-upstream
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    name: Safely preserve upstream refs
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      SOURCE_REPO: storytold/pdfcraft
+      ARCHIVE_REPO: ${{ github.repository }}
+      ARCHIVE_TOKEN: ${{ github.token }}
+    steps:
+      - name: Clone original upstream history
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git clone --mirror "https://github.com/${SOURCE_REPO}.git" source.git
+          cd source.git
+          git remote add archive "https://x-access-token:${ARCHIVE_TOKEN}@github.com/${ARCHIVE_REPO}.git"
+
+          # Protect EVERY observed branch tip before any branch is updated.
+          mapfile -t tips < <(git for-each-ref --format='%(objectname)' refs/heads | sort -u)
+          if (("${#tips[@]}" == 0)); then
+            echo "::error::No upstream branches; refusing to change the archive"
+            exit 1
+          fi
+          for sha in "${tips[@]}"; do
+            git push --quiet archive "${sha}:refs/tags/retained/${sha}"
+          done
+
+          # Track upstream branches without touching the control branch or deleting missing branches.
+          git push --quiet archive '+refs/heads/*:refs/heads/upstream/*'
+
+          # Preserve upstream tags with their original names under a separate namespace.
+          # Existing remote tags are never rewritten, even if upstream tags move.
+          if git for-each-ref --format='%(refname)' refs/tags | grep -q .; then
+            git push --quiet archive 'refs/tags/*:refs/tags/source-tags/*' || {
+              echo "::warning::Some upstream tags changed or were rejected; previously saved tags are kept"
+            }
+          fi
+          echo "Mirror complete: all observed branch tips retained; no delete/prune performed."
