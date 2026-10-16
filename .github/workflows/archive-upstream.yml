@@ -1,4 +1,4 @@
-name: Archive upstream Git history
+name: Preserve upstream source (Git bundle)
 
 on:
   push:
@@ -18,40 +18,46 @@ concurrency:
 
 jobs:
   archive:
-    name: Safely preserve upstream refs
+    name: Store restorable Git history snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
       SOURCE_REPO: storytold/pdfcraft
-      ARCHIVE_REPO: ${{ github.repository }}
-      ARCHIVE_TOKEN: ${{ github.token }}
+      DEST_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Clone original upstream history
+      - name: Fetch upstream and publish a permanent snapshot
         shell: bash
         run: |
           set -Eeuo pipefail
-          git clone --mirror "https://github.com/${SOURCE_REPO}.git" source.git
-          cd source.git
-          git remote add archive "https://x-access-token:${ARCHIVE_TOKEN}@github.com/${ARCHIVE_REPO}.git"
 
-          # Protect EVERY observed branch tip before any branch is updated.
-          mapfile -t tips < <(git for-each-ref --format='%(objectname)' refs/heads | sort -u)
-          if (("${#tips[@]}" == 0)); then
-            echo "::error::No upstream branches; refusing to change the archive"
+          # A Git bundle preserves original commits, tags and workflow files without
+          # attempting to push upstream GitHub Actions workflow commits as Git refs.
+          git clone --mirror "https://github.com/${SOURCE_REPO}.git" source.git
+
+          ref_list="$(git -C source.git for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | LC_ALL=C sort)"
+          if [[ -z "${ref_list}" ]]; then
+            echo "::error::No upstream Git refs found; existing releases are preserved"
             exit 1
           fi
-          for sha in "${tips[@]}"; do
-            git push --quiet archive "${sha}:refs/tags/retained/${sha}"
-          done
 
-          # Track upstream branches without touching the control branch or deleting missing branches.
-          git push --quiet archive '+refs/heads/*:refs/heads/upstream/*'
-
-          # Preserve upstream tags with their original names under a separate namespace.
-          # Existing remote tags are never rewritten, even if upstream tags move.
-          if git for-each-ref --format='%(refname)' refs/tags | grep -q .; then
-            git push --quiet archive 'refs/tags/*:refs/tags/source-tags/*' || {
-              echo "::warning::Some upstream tags changed or were rejected; previously saved tags are kept"
-            }
+          fingerprint="$(printf '%s\n' "${ref_list}" | sha256sum | cut -c1-20)"
+          snapshot="snapshot-${fingerprint}"
+          if gh release view "${snapshot}" --repo "${DEST_REPO}" >/dev/null 2>&1; then
+            echo "No upstream ref changes since previously captured ${snapshot}; existing snapshot is retained."
+            exit 0
           fi
-          echo "Mirror complete: all observed branch tips retained; no delete/prune performed."
+
+          git -C source.git bundle create "../upstream.bundle" --all
+          git -C source.git bundle verify "../upstream.bundle"
+
+          printf 'Upstream: https://github.com/%s\nRef fingerprint: %s\nSnapshot created: %s\n\nRestoration:\n  git clone upstream.bundle restored-project\n\nThis bundle contains upstream Git branches, tags and history. Git LFS objects and GitHub Release assets are not included.\n' "${SOURCE_REPO}" "${fingerprint}" "$(date -u +%FT%TZ)" > SNAPSHOT.txt
+
+          # The workflow token has contents:write, enough for release assets.
+          # Unlike a Git push of source commits, this does not need workflows scope.
+          gh release create "${snapshot}" upstream.bundle SNAPSHOT.txt \
+            --repo "${DEST_REPO}" --target main \
+            --title "Upstream Git history ${fingerprint}" \
+            --notes "Immutable Git bundle snapshot of https://github.com/${SOURCE_REPO}; captured ref fingerprint ${fingerprint}. Download upstream.bundle to restore original branches and history."
+
+          echo "Saved new independent restore point: ${snapshot}"
